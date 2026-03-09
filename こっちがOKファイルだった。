@@ -1,0 +1,247 @@
+import SwiftUI
+import MultipeerConnectivity
+import Combine
+// ================================
+// MultipeerManager
+// ================================
+
+class MultipeerManager: NSObject, ObservableObject {
+    
+    // UI表示
+    @Published var statusText = "未接続"
+    @Published var receivedText = ""
+    
+    // service
+    private let serviceType = "ultra-mpc"
+    
+    // PeerID
+    private let myPeerID = MCPeerID(displayName: UUID().uuidString)
+    
+    // session
+    private lazy var session: MCSession = {
+        let s = MCSession(peer: myPeerID, securityIdentity: nil, encryptionPreference: .required)
+        s.delegate = self
+        return s
+    }()
+    
+    // advertiser
+    private lazy var advertiser: MCNearbyServiceAdvertiser = {
+        let adv = MCNearbyServiceAdvertiser(
+            peer: myPeerID,
+            discoveryInfo: nil,
+            serviceType: serviceType
+        )
+        adv.delegate = self
+        return adv
+    }()
+    
+    // browser
+    private lazy var browser: MCNearbyServiceBrowser = {
+        let br = MCNearbyServiceBrowser(
+            peer: myPeerID,
+            serviceType: serviceType
+        )
+        br.delegate = self
+        return br
+    }()
+    
+    // 再接続タイマー
+    private var reconnectTimer: Timer?
+    
+    // ================================
+    // start
+    // ================================
+    
+    func start() {
+        
+        statusText = "検索開始"
+        
+        advertiser.startAdvertisingPeer()
+        browser.startBrowsingForPeers()
+        
+        startReconnectWatcher()
+    }
+    
+    // ================================
+    // reconnect監視
+    // ================================
+    
+    private func startReconnectWatcher() {
+        
+        reconnectTimer?.invalidate()
+        
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+            
+            if self.session.connectedPeers.isEmpty {
+                
+                DispatchQueue.main.async {
+                    self.statusText = "再接続検索中..."
+                }
+                
+                self.browser.startBrowsingForPeers()
+                self.advertiser.startAdvertisingPeer()
+            }
+        }
+    }
+    
+    // ================================
+    // send
+    // ================================
+    
+    func send(text: String) {
+        
+        guard !session.connectedPeers.isEmpty else {
+            return
+        }
+        
+        guard let data = text.data(using: .utf8) else { return }
+        
+        do {
+            try session.send(data, toPeers: session.connectedPeers, with: .unreliable)
+        } catch {
+            print("send error")
+        }
+    }
+}
+
+// ================================
+// Session Delegate
+// ================================
+
+extension MultipeerManager: MCSessionDelegate {
+    
+    func session(_ session: MCSession,
+                 peer peerID: MCPeerID,
+                 didChange state: MCSessionState) {
+        
+        DispatchQueue.main.async {
+            
+            switch state {
+                
+            case .connected:
+                self.statusText = "接続成功"
+                
+                self.browser.stopBrowsingForPeers()
+                self.advertiser.stopAdvertisingPeer()
+                
+            case .connecting:
+                self.statusText = "接続中..."
+                
+            case .notConnected:
+                self.statusText = "切断"
+                
+            @unknown default:
+                self.statusText = "不明"
+            }
+        }
+    }
+    
+    func session(_ session: MCSession,
+                 didReceive data: Data,
+                 fromPeer peerID: MCPeerID) {
+        
+        let text = String(data: data, encoding: .utf8) ?? ""
+        
+        DispatchQueue.main.async {
+            self.receivedText = text
+        }
+    }
+    
+    func session(_: MCSession,
+                 didReceive _: InputStream,
+                 withName _: String,
+                 fromPeer _: MCPeerID) {}
+    
+    func session(_: MCSession,
+                 didStartReceivingResourceWithName _: String,
+                 fromPeer _: MCPeerID,
+                 with _: Progress) {}
+    
+    func session(_: MCSession,
+                 didFinishReceivingResourceWithName _: String,
+                 fromPeer _: MCPeerID,
+                 at _: URL?,
+                 withError _: Error?) {}
+}
+
+// ================================
+// Advertiser Delegate
+// ================================
+
+extension MultipeerManager: MCNearbyServiceAdvertiserDelegate {
+    
+    func advertiser(_ advertiser: MCNearbyServiceAdvertiser,
+                    didReceiveInvitationFromPeer peerID: MCPeerID,
+                    withContext context: Data?,
+                    invitationHandler: @escaping (Bool, MCSession?) -> Void) {
+        
+        invitationHandler(true, session)
+    }
+}
+
+// ================================
+// Browser Delegate
+// ================================
+
+extension MultipeerManager: MCNearbyServiceBrowserDelegate {
+    
+    func browser(_ browser: MCNearbyServiceBrowser,
+                 foundPeer peerID: MCPeerID,
+                 withDiscoveryInfo info: [String : String]?) {
+        
+        if session.connectedPeers.isEmpty {
+            browser.invitePeer(peerID, to: session, withContext: nil, timeout: 10)
+        }
+    }
+    
+    func browser(_: MCNearbyServiceBrowser, lostPeer _: MCPeerID) {}
+}
+
+// ================================
+// UI
+// ================================
+
+struct ContentView: View {
+    
+    @StateObject var mpc = MultipeerManager()
+    @State private var text = ""
+    
+    var body: some View {
+        
+        VStack(spacing: 40) {
+            
+            Text(mpc.statusText)
+                .font(.title)
+            
+            Text("受信: \(mpc.receivedText)")
+                .font(.title2)
+            
+            TextField("送信文字", text: $text)
+                .textFieldStyle(.roundedBorder)
+                .padding()
+            
+            Button("送信") {
+                mpc.send(text: text)
+            }
+            
+            Button("接続開始") {
+                mpc.start()
+            }
+        }
+        .padding()
+    }
+}
+
+// ================================
+// App
+// ================================
+
+@main
+struct MPCUltraApp: App {
+    
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}
