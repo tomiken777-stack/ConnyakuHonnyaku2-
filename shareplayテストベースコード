@@ -1,0 +1,112 @@
+import Foundation
+import Combine
+import GroupActivities
+
+// 1. SharePlayで共有する「アクティビティ」の定義
+struct DoujituCallActivity: GroupActivity {
+    // 共有シートやiMessageに表示されるアプリの情報
+    var metadata: GroupActivityMetadata {
+        var meta = GroupActivityMetadata()
+        meta.title = "Doujitu Phone"
+        meta.subtitle = "翻訳通話に参加"
+        meta.type = .generic
+        return meta
+    }
+}
+
+// 2. MultipeerManagerの代わりとなる通信マネージャー
+@MainActor
+class SharePlayManager: ObservableObject {
+    @Published var statusText = "未接続"
+    @Published var isConnected = false
+    var onReceiveData: ((String, String) -> Void)?
+
+    private var messenger: GroupSessionMessenger?
+    private var sessionTask: Task<Void, Never>?
+    private var currentSession: GroupSession<DoujituCallActivity>?
+    private var cancellables = Set<AnyCancellable>()
+
+    func start() {
+        statusText = "SharePlay待機中..."
+        
+        // 1. セッション（参加者の集まり）の監視を開始
+        configureGroupSessions()
+        
+        // 2. SharePlayのシステムUIを呼び出してアクティベート
+        Task {
+            do {
+                let activity = DoujituCallActivity()
+                // FaceTime中なら即同期、していない場合は共有シート（iMessage等）が開きます
+                let result = try await activity.activate()
+                print("Activity Activate Result: \(result)")
+            } catch {
+                self.statusText = "エラー: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func configureGroupSessions() {
+        // 新しいセッションが作られた（または招待から参加した）時の処理
+        sessionTask = Task {
+            for await session in DoujituCallActivity.sessions() {
+                self.currentSession = session
+                
+                // データ送受信用のメッセンジャーを作成
+                let messenger = GroupSessionMessenger(session: session)
+                self.messenger = messenger
+
+                self.statusText = "接続成功"
+                self.isConnected = true
+
+                // メッセージ（CallDataPacket）の受信を監視するタスク
+                let receiveTask = Task {
+                    do {
+                        // 相手からデータが送られてくるたびにここが呼ばれる
+                        for try await (packet, _) in messenger.messages(of: CallDataPacket.self) {
+                            self.onReceiveData?(packet.text, packet.languageCode)
+                        }
+                    } catch {
+                        print("Receive error: \(error)")
+                    }
+                }
+
+                // セッションが切断された時の処理
+                session.$state.sink { state in
+                    if case .invalidated = state {
+                        self.isConnected = false
+                        self.statusText = "切断されました"
+                        receiveTask.cancel()
+                        self.messenger = nil
+                        self.currentSession = nil
+                    }
+                }.store(in: &cancellables)
+
+                // セッションに参加
+                session.join()
+            }
+        }
+    }
+
+    // 相手にテキストと言語コードを送信する
+    func send(text: String, langCode: String) {
+        guard let messenger = messenger else { return }
+        let packet = CallDataPacket(text: text, languageCode: langCode)
+        Task {
+            do {
+                try await messenger.send(packet)
+            } catch {
+                print("Send error: \(error)")
+            }
+        }
+    }
+
+    // 通話を終了する
+    func stop() {
+        currentSession?.leave()
+        currentSession = nil
+        messenger = nil
+        sessionTask?.cancel()
+        isConnected = false
+        statusText = "切断されました"
+    }
+}
