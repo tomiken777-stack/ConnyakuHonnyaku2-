@@ -1,0 +1,118 @@
+import SwiftUI
+import GroupActivities
+
+// ---------------------------------------------------
+// 1. 通信の定義（どんなデータをやり取りするかのチケット）
+// ---------------------------------------------------
+struct TranslationActivity: GroupActivity {
+    var metadata: GroupActivityMetadata {
+        var meta = GroupActivityMetadata()
+        meta.title = "翻訳テキストのデータ通信"
+        meta.type = .generic // メディア再生ではなくデータ通信用
+        return meta
+    }
+}
+
+// 送受信するデータの形（今回はシンプルに翻訳テキスト）
+struct TranslationMessage: Codable {
+    let text: String
+}
+
+// ---------------------------------------------------
+// 2. 通信の管理者（裏側でデータを送ったり受け取ったりする役）
+// ---------------------------------------------------
+@MainActor
+class SharePlayManager: ObservableObject {
+    @Published var receivedText: String = "まだ受信していません"
+    
+    var session: GroupSession<TranslationActivity>?
+    var messenger: GroupSessionMessenger?
+    var tasks = Set<Task<Void, Never>>()
+    
+    // ① SharePlayの通信を開始する
+    func startSharing() {
+        Task {
+            do {
+                _ = try await TranslationActivity().activate()
+            } catch {
+                print("開始エラー: \(error)")
+            }
+        }
+    }
+    
+    // ② 相手と繋がった時の設定（パイプを繋ぐ）
+    func configureGroupSession(_ session: GroupSession<TranslationActivity>) {
+        self.session = session
+        let messenger = GroupSessionMessenger(session: session)
+        self.messenger = messenger
+        
+        // ③ 常にデータを受信できるように耳を澄ませておく
+        let task = Task {
+            for await (message, _) in messenger.messages(of: TranslationMessage.self) {
+                // データが届いたら画面のテキストを更新
+                self.receivedText = message.text
+            }
+        }
+        tasks.insert(task)
+        session.join()
+    }
+    
+    // ④ データを相手に送る
+    func sendText(_ text: String) {
+        let message = TranslationMessage(text: text)
+        Task {
+            do {
+                try await messenger?.send(message)
+            } catch {
+                print("送信エラー: \(error)")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------
+// 3. 画面の見た目（テスト用のシンプルなUI）
+// ---------------------------------------------------
+struct ContentView: View {
+    @StateObject var manager = SharePlayManager()
+    @State var inputText: String = ""
+    
+    var body: some View {
+        VStack(spacing: 40) {
+            
+            // 受信したテキストの表示エリア
+            VStack {
+                Text("相手からのメッセージ:")
+                    .foregroundColor(.gray)
+                Text(manager.receivedText)
+                    .font(.title)
+                    .bold()
+            }
+            
+            // 送信するテキストの入力エリア
+            VStack {
+                TextField("送るテキストを入力", text: $inputText)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .padding(.horizontal)
+                
+                Button("送信する") {
+                    manager.sendText(inputText)
+                    inputText = "" // 送信後に空にする
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            
+            // SharePlay開始ボタン
+            Button("SharePlayを開始") {
+                manager.startSharing()
+            }
+            .padding(.top, 20)
+        }
+        // アプリ起動時にSharePlayの招待を待ち受けるおまじない
+        .task {
+            for await session in TranslationActivity.sessions() {
+                manager.configureGroupSession(session)
+            }
+        }
+    }
+}
